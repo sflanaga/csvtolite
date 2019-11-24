@@ -10,11 +10,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use structopt::StructOpt;
 
-use rusqlite::{NO_PARAMS, MappedRows};
+use rusqlite::{NO_PARAMS, MappedRows, Statement};
 use rusqlite::{Column, Connection, Row};
 use lazy_static::lazy_static;
-use csv::StringRecord;
+use csv::{StringRecord, ByteRecord};
 use regex::internal::Input;
+
+//
+// handle verbose logging succinctly - not a lot of fuss here
+//
+macro_rules! mylog {
+    ($level:expr, $fmt:expr) => {
+        {
+            if CLI.verbose >= (($level) as usize) {
+                eprintln!("{:?}", $fmt);
+            }
+        }
+    };
+    ($level:expr, $fmt:expr, $($arg:tt)+) => {
+        {
+            if CLI.verbose >= (($level) as usize) {
+                eprintln!($fmt, $($arg)+);
+            }
+        }
+    }
+}
+
+
 
 fn main() -> Result<()> {
     import_csv()?;
@@ -86,7 +108,7 @@ pub struct CliCfg {
 
 }
 
-fn _get_cli() -> anyhow::Result<CliCfg> {
+fn get_cli() -> anyhow::Result<CliCfg> {
     let ccfg = {
         let mut ccfg: CliCfg = CliCfg::from_args();
         for f in &ccfg.files {
@@ -113,20 +135,9 @@ fn _get_cli() -> anyhow::Result<CliCfg> {
     Ok(ccfg)
 }
 
-fn get_cli() -> CliCfg {
-    match _get_cli()  {
-        Err(e) => {
-            eprintln!("Error in cli options: {}", e);
-            exit(1);
-        }
-        Ok(c) => c,
-    }
-}
-
-
 lazy_static! {
     static ref CLI: CliCfg = {
-       match _get_cli() {
+       match get_cli() {
             Err(e) => {
                 eprintln!("Error in cli options: {}", e);
                 exit(1);
@@ -221,15 +232,40 @@ fn import_csv() -> Result<()> {
 
 fn load_file(cfg: &CliCfg, conn: &Connection, pathbuf: &PathBuf) -> Result<()> {
     let tablename = get_table_name(&pathbuf)?;
-    if cfg.verbose > 0 { eprintln!("tablename: {} from file: {}", &tablename, &pathbuf.display()); }
-    let fields = schema(&conn, &tablename)?;
-    for f in &fields {
-        eprintln!("{:?}", &f);
-    }
-    if cfg.verbose > 1 { eprintln!("fields: {:#?}", &fields); }
+    mylog!(1, "tablename: {} from file: {}", &tablename, &pathbuf.display());
+
+    let table_schema = schema(&conn, &tablename)?;
+    mylog!(2, "table schema: {:#?}", &table_schema);
 
     let file_schema = detect_file_schema(pathbuf)?;
-    if cfg.verbose > 1 { eprintln!("file schema, file: {}, schema: {:#?}", &pathbuf.display(), &file_schema); }
+    mylog!(2, "file schema, file: {}, schema: {:#?}", &pathbuf.display(), &file_schema);
+
+    if table_schema.len() == 0 {
+        // create table
+        create_table(&conn, &tablename, &file_schema)?;
+
+    } else {
+        //
+        // compare db schema vs file schema
+        //
+        if table_schema.len() != file_schema.len() {
+            return Err(anyhow!("Schema diff in number of fields: table fields {} vs file field {}  table: {}  file: {}", table_schema.len(), file_schema.len(), &tablename, &pathbuf.display()));
+        }
+        for cmp in table_schema.iter().zip(file_schema.iter()) {
+            let tmp: (&Field, &Field) = cmp;
+            if tmp.0.name != tmp.1.name {
+                return Err(anyhow!("Schema diff in name: table field {} vs file field {}  table: {}  file: {}", &tmp.0.name, &tmp.1.name, &tablename, &pathbuf.display()));
+            } else if tmp.0.db_type != tmp.1.db_type {
+                return Err(anyhow!("Schema diff in type: table field {} vs file field {}  table: {}  file: {}", &tmp.0.db_type, &tmp.1.db_type, &tablename, &pathbuf.display()));
+            }
+        }
+    }
+
+    //
+    // load data
+    //
+    write_to_db(&conn, &pathbuf, &tablename,&file_schema)?;
+
 
     Ok(())
 }
@@ -256,17 +292,20 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
             if CLI.headeron {
                 // this first line is the header to gather that info
                 for (i, f) in record.iter().enumerate() {
-                    schema.push(Field {
+                    let f = Field {
                         pos: i as u32,
                         name: f.to_string(),
                         db_type: "text".to_string(),
-                    });
+                    };
+                    println!("insert {:?}", f);
+                    schema.push(f);
                 }
+
             }
             field_count = record.len();
         } else {
             if record.len() != field_count {
-                return Err(anyhow!("Field count inconsistency: line: {}  field count: {}  expect field count: {}  file: {}", line_count, record.len(), field_count, &pathbuf.display()));
+                return Err(anyhow!("Field count inconsistency: line: {}  field count: {}  expected field count: {}  file: {}", line_count, record.len(), field_count, &pathbuf.display()));
             }
         }
         if line_count > 10 {
@@ -276,19 +315,19 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
 
     if CLI.headeron {
         if field_count == 0 {
-            return Err(anyhow!("Did not field headers so cannot schema-check {}", pathbuf.display()));
+            return Err(anyhow!("Did not field headers so cannot schema-check on file: {}", pathbuf.display()));
         }
         return Ok(schema);
     } else {
         if field_count == 0 {
-            return Err(anyhow!("Did not anything (empty?) to schema-check {}", pathbuf.display()));
+            return Err(anyhow!("Did not find anything (empty?) to schema-check on file: {}", pathbuf.display()));
         } else {
             for i in 0..field_count {
                 schema.push(
                     Field {
                         pos: i as u32,
                         name: format!("f{}", i),
-                        db_type: "db_type".to_string(),
+                        db_type: "text".to_string(),
                     }
                 );
             }
@@ -296,4 +335,74 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
     }
 
     Ok(schema)
+}
+
+
+
+
+fn write_to_db(conn: &Connection, pathbuf: &PathBuf, tablename: &str, f_sch: &Vec<Field>) -> Result<(u64, u64)> {
+    let mut rdr = match DecompressionReader::new(&pathbuf) {
+        Ok(rdr) => rdr,
+        Err(err) => Err(anyhow!("Cannot read file \"{}\", due to error: {}", pathbuf.display(), err))?,
+    };
+    let mut builder = csv::ReaderBuilder::new();
+    builder.delimiter(CLI.field_sep).has_headers(false).flexible(true).escape(CLI.escape).quote(CLI.quote as u8).comment(CLI.comment);
+    let mut rec_rdr =builder.from_reader(rdr);
+    let mut line_count = 0;
+    let mut sql = format!("insert into {} ( {} ) \nvalues( {} );", &tablename,
+                          f_sch.iter().map(|f| f.name.as_str()).collect::<Vec<&str>>().join(", "),
+                          f_sch.iter().enumerate().map(|(i, e)| format!("?{}", i + 1)).collect::<Vec<String>>().join(", "));
+
+    let mut stmt = conn.prepare(&sql).with_context(|| format!("Sql used: {}", &sql))?;
+    mylog!(2, "SQL for load: {}", &sql);
+    conn.execute_batch("begin transaction;")?;
+
+    let mut x_complete = std::cell::Cell::new(false);
+    use scopeguard::defer;
+
+    defer! {{
+        mylog!(1, "in defer of write_to_db");
+        if !x_complete.get() {
+            mylog!(1, "rollback in defer for write_to_db");
+
+            if let Err(e) = conn.execute_batch("rollback;") {
+                mylog!(0, "There was a problem with deferal rollback: {}", e);
+            }
+        }
+    }};
+
+    let (mut row_count, mut field_count) = (0u64, 0u64);
+    for record in rec_rdr.records() {
+        let record = record?;
+        line_count += 1;
+        if line_count == 1 && CLI.headeron {
+            // skip this line and assume it was already checked header vs schema
+
+        } else {
+            // we know that stmt must be set by now
+            stmt.execute(&record)?;
+            row_count +=1;
+            field_count += f_sch.len() as u64;
+        }
+        // TODO:
+    }
+    conn.execute_batch("commit;")?;
+    x_complete.set(true);
+
+    Ok((row_count,field_count))
+}
+
+fn create_table(conn: &Connection, tablename: &str, f_sch: &Vec<Field>) -> Result<()> {
+
+    let mut sql = format!("create table {} (\n", tablename);
+    for f in f_sch.iter().take(f_sch.len()-1) {
+        sql.push_str(&format!("\t{} {},", f.name, f.db_type));
+    }
+    let last: &Field = f_sch.iter().rev().nth(0).unwrap();
+    sql.push_str(&format!("\t{} {}\n);", last.name, last.db_type));
+    mylog!(1, "Executing create sql: {}", &sql);
+
+    conn.execute(sql.as_str(), NO_PARAMS)?;
+
+    Ok(())
 }
