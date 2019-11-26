@@ -61,19 +61,25 @@ fn parse_char_into_u8(src: &str) -> Result<u8> {
 #[structopt(
 global_settings(& [structopt::clap::AppSettings::ColoredHelp, structopt::clap::AppSettings::VersionlessSubcommands, structopt::clap::AppSettings::DeriveDisplayOrder]),
 //raw(setting = "structopt::clap::AppSettings::DeriveDisplayOrder"),
-author, about
+author, about=r"
+Import csv files into sqlite3
+
+e.g. csv2lite -f flights_1.csv flights_2.csv -r '^(.+)_\d+\.csv' -s '|' -d mytest.db
+    writes flight data into a table called flights into mytest.db sqlite3 database
+"
 )]
-///
-/// import csv files into sqlite3
-///
 pub struct CliCfg {
     #[structopt(short = "f", name = "file", parse(from_os_str))]
     /// list of input files
     pub files: Vec<PathBuf>,
 
     #[structopt(short = "r", name = "filere")]
-    /// regex to parse filename to find tablename
-    pub file_re: String,
+    /// regex to parse tablename out of the filename(s) using the 1st sub group
+    pub file_re: Option<String>,
+
+    #[structopt(short = "t", name = "tablename")]
+    /// Tablename into which to write data
+    pub tablename: Option<String>,
 
     #[structopt(short = "d", name = "db", parse(from_os_str))]
     /// existing database to import into
@@ -100,11 +106,20 @@ pub struct CliCfg {
     pub comment: Option<u8>,
 
     #[structopt(long = "headeron")]
-    /// Cut ON header parsing for field name
+    /// Cut ON header parsing for field name in table.
     ///
-    /// Defaults to just using f1, f2, f3 as table fieldnames
+    /// Defaults to just using f1, f2, f3 as table field names.  It uses the first line as the
+    /// guide for this.
     pub headeron: bool,
 
+    #[structopt(long = "sanity_sample", default_value("0"))]
+    /// Number of rows to sanity check against header and schema - zero means all and is the default
+    pub sanity_sample: u64,
+
+    #[structopt(long = "ignore_field_count")]
+    /// Allow import of records that have different number of fields from header
+    /// or table
+    pub ignore_field_count: bool,
 
 }
 
@@ -126,7 +141,14 @@ fn get_cli() -> anyhow::Result<CliCfg> {
             ));
         }
 
-        let re = Regex::new(&ccfg.file_re)?;
+        if ccfg.file_re.is_none() == ccfg.tablename.is_none() {
+            return Err(anyhow!("One of file_re or tablename must be specified and not both"))
+        }
+
+        if let Some(file_re) = &ccfg.file_re {
+            let re = Regex::new(file_re)?;
+        }
+
         if ccfg.verbose > 0 {
             eprintln!("Cli cfg: {:#?}", ccfg);
         }
@@ -149,33 +171,29 @@ lazy_static! {
 
 
 fn get_table_name(path: &PathBuf) -> Result<String> {
-    Ok(String::from(
-        Regex::new(&CLI.file_re)?
-            .captures(path.to_str().expect("unable to convert path to &str"))
-            .expect(&format!(
-                "was not able to match path to file re {}",
-                path.display()
-            ))
-            .get(1)
-            .expect(&format!(
-                "sub group from file re did not match or is not available: {}",
-                path.display()
-            ))
-            .as_str(),
-    ))
-
-    // let re = Regex::new(&cfg.file_re)?;
-    // let caps = re.captures(path.to_str().unwrap()).unwrap();
-    // if caps.len() <= 2 {
-    //     return Err(anyhow!("path does not match re and cannot find sub gropus"));
-    // } else {
-    //     return Ok(String::from(caps.get(1).unwrap().as_str()));
-    // }
+    if let Some(file_re) = &CLI.file_re {
+        Ok(String::from(
+            Regex::new(file_re.as_str())?
+                .captures(path.to_str().expect("unable to convert path to &str"))
+                .expect(&format!(
+                    "was not able to match path to file re {}",
+                    path.display()
+                ))
+                .get(1)
+                .expect(&format!(
+                    "sub group from file re did not match or is not available: {}",
+                    path.display()
+                ))
+                .as_str(),
+        ))
+    } else {
+        Ok(String::from(CLI.tablename.as_ref().unwrap()))
+    }
 }
 
 fn _does_table_exist(conn: &Connection, tablename: &str) -> Result<Vec<Vec<String>>> {
     let sql = format!("pragma table_info({});", &tablename);
-    println!("running sql: {}", &sql);
+    mylog!(1, "running sql: {}", &sql);
     let mut fields: Vec<Vec<String>> = Vec::new();
     let mut stmt = conn.prepare(sql.as_str())?;
     let rows = stmt.query_map(NO_PARAMS, |row| {
@@ -248,7 +266,7 @@ fn load_file(cfg: &CliCfg, conn: &Connection, pathbuf: &PathBuf) -> Result<()> {
         //
         // compare db schema vs file schema
         //
-        if table_schema.len() != file_schema.len() {
+        if !CLI.ignore_field_count && table_schema.len() != file_schema.len() {
             return Err(anyhow!("Schema diff in number of fields: table fields {} vs file field {}  table: {}  file: {}", table_schema.len(), file_schema.len(), &tablename, &pathbuf.display()));
         }
         for cmp in table_schema.iter().zip(file_schema.iter()) {
@@ -283,8 +301,13 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
     let mut rec_rdr =builder.from_reader(rdr);
     let mut line_count = 0;
 
-    let mut field_count = 0;
+    let mut header_field_count = 0;
 
+    let sanity_sample = if CLI.headeron {
+        CLI.sanity_sample  +1
+    } else {
+        CLI.sanity_sample
+    };
     for record in rec_rdr.records() {
         let record = record?;
         line_count += 1;
@@ -297,32 +320,33 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
                         name: f.to_string(),
                         db_type: "text".to_string(),
                     };
-                    println!("insert {:?}", f);
                     schema.push(f);
                 }
 
             }
-            field_count = record.len();
+            header_field_count = record.len();
         } else {
-            if record.len() != field_count {
-                return Err(anyhow!("Field count inconsistency: line: {}  field count: {}  expected field count: {}  file: {}", line_count, record.len(), field_count, &pathbuf.display()));
+            if line_count > sanity_sample { break; }
+            if !CLI.ignore_field_count || record.len() != header_field_count {
+                return Err(anyhow!("Field count inconsistency: line: {}  field count: {}  expected field count: {}  file: {}", line_count, record.len(), header_field_count, &pathbuf.display()));
             }
         }
+
         if line_count > 10 {
             break;
         }
     }
 
     if CLI.headeron {
-        if field_count == 0 {
+        if header_field_count == 0 {
             return Err(anyhow!("Did not field headers so cannot schema-check on file: {}", pathbuf.display()));
         }
         return Ok(schema);
     } else {
-        if field_count == 0 {
+        if header_field_count == 0 {
             return Err(anyhow!("Did not find anything (empty?) to schema-check on file: {}", pathbuf.display()));
         } else {
-            for i in 0..field_count {
+            for i in 0..header_field_count {
                 schema.push(
                     Field {
                         pos: i as u32,
@@ -350,7 +374,7 @@ fn write_to_db(conn: &Connection, pathbuf: &PathBuf, tablename: &str, f_sch: &Ve
     let mut rec_rdr =builder.from_reader(rdr);
     let mut line_count = 0;
     let mut sql = format!("insert into {} ( {} ) \nvalues( {} );", &tablename,
-                          f_sch.iter().map(|f| f.name.as_str()).collect::<Vec<&str>>().join(", "),
+                          f_sch.iter().map(|f| format!("[{}]", &f.name)).collect::<Vec<String>>().join(", "),
                           f_sch.iter().enumerate().map(|(i, e)| format!("?{}", i + 1)).collect::<Vec<String>>().join(", "));
 
     let mut stmt = conn.prepare(&sql).with_context(|| format!("Sql used: {}", &sql))?;
@@ -361,25 +385,36 @@ fn write_to_db(conn: &Connection, pathbuf: &PathBuf, tablename: &str, f_sch: &Ve
     use scopeguard::defer;
 
     defer! {{
-        mylog!(1, "in defer of write_to_db");
         if !x_complete.get() {
             mylog!(1, "rollback in defer for write_to_db");
-
             if let Err(e) = conn.execute_batch("rollback;") {
                 mylog!(0, "There was a problem with deferal rollback: {}", e);
             }
         }
     }};
 
+
     let (mut row_count, mut field_count) = (0u64, 0u64);
-    for record in rec_rdr.records() {
-        let record = record?;
+    let mut record = StringRecord::new();
+    while rec_rdr.read_record(&mut record)? {
         line_count += 1;
         if line_count == 1 && CLI.headeron {
             // skip this line and assume it was already checked header vs schema
 
         } else {
             // we know that stmt must be set by now
+            // extend any missing blanks
+            if CLI.ignore_field_count {
+                if f_sch.len() > record.len() {
+                    for _ in record.len()..f_sch.len() { record.push_field(""); }
+                } else if record.len() > f_sch.len() {
+                    record.truncate(f_sch.len());
+                }
+            } else {
+                if record.len() != f_sch.len() {
+                    return Err(anyhow!("Error trying batch insert record {}:{} field expected: {}  fields found: {}", pathbuf.display(),line_count, f_sch.len(), record.len()));
+                }
+            }
             stmt.execute(&record)?;
             row_count +=1;
             field_count += f_sch.len() as u64;
@@ -396,7 +431,7 @@ fn create_table(conn: &Connection, tablename: &str, f_sch: &Vec<Field>) -> Resul
 
     let mut sql = format!("create table {} (\n", tablename);
     for f in f_sch.iter().take(f_sch.len()-1) {
-        sql.push_str(&format!("\t{} {},", f.name, f.db_type));
+        sql.push_str(&format!("\t[{}] {},", f.name, f.db_type));
     }
     let last: &Field = f_sch.iter().rev().nth(0).unwrap();
     sql.push_str(&format!("\t{} {}\n);", last.name, last.db_type));

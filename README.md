@@ -22,14 +22,15 @@ Work in progress.
 
 TODO:
 
-- tablename option vs automatic regex one
+- DONE: tablename option vs automatic regex one
 - post sql file - good with in memory database
 - statistics / progress ticker
-- test lesser/greater field count input and option to still execute one or the other
+- DONE: ignore field count
+  - test lesser/greater field count input and option to still execute one or the other
   - lesser not default but greater is ok by default
 - add different stdio and related options
 - automatically determine types of the files in the csv file based on sampling, etc.
-- support wacky field names [xynz$#@]
+- DONE: easy just added [] around sql statements - support wacky field names [xynz$#@]
 - overwrite table option
 
 Related project:
