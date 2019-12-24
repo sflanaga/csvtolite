@@ -434,7 +434,7 @@ fn create_table(conn: &Connection, tablename: &str, f_sch: &Vec<Field>) -> Resul
         sql.push_str(&format!("\t[{}] {},", f.name, f.db_type));
     }
     let last: &Field = f_sch.iter().rev().nth(0).unwrap();
-    sql.push_str(&format!("\t{} {}\n);", last.name, last.db_type));
+    sql.push_str(&format!("\t[{}] {}\n);", last.name, last.db_type));
     mylog!(1, "Executing create sql: {}", &sql);
 
     conn.execute(sql.as_str(), NO_PARAMS)?;
