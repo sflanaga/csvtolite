@@ -13,8 +13,10 @@ use structopt::StructOpt;
 
 use csv::{StringRecord};
 use lazy_static::lazy_static;
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, Row, OpenFlags};
 use rusqlite::{Statement, NO_PARAMS};
+use rusqlite::types::Value;
+use rusqlite::types::Type::{Null, Integer, Text, Blob};
 
 
 fn main() -> Result<()> {
@@ -93,6 +95,19 @@ pub struct CliCfg {
     /// Allow import of records that have different number of fields from header
     /// or table
     pub ignore_field_count: bool,
+
+    #[structopt(long = "sqls")]
+    /// Run 1 or more sql after the import.  Good especially for memory based DBs.
+    pub sqls: Vec<String>,
+
+    #[structopt(long = "out_delimiter", default_value(","))]
+    /// Run 1 or more sql after the import.  Good especially for memory based DBs.
+    pub out_delimiter: String,
+
+    #[structopt(long = "memory")]
+    /// Create the database in memory - note use with --sqls as it will disappear
+    pub memory: bool,
+
 }
 
 fn get_cli() -> anyhow::Result<CliCfg> {
@@ -223,14 +238,64 @@ fn schema(cfg: &CliCfg, conn: &Connection, tablename: &str) -> Result<Vec<Field>
 
 fn import_csv() -> Result<()> {
     trace!("opening DB");
-    let conn = Connection::open(&CLI.db_file)?;
+
+    let conn = if CLI.memory {
+        warn!("opening in memory only");
+        Connection::open_in_memory()?
+    } else {
+        Connection::open(&CLI.db_file)?
+    };
+
     trace!("conn created starting loads");
     for pathbuf in &CLI.files {
         load_file(&CLI, &conn, &pathbuf)?;
     }
 
+    run_post_sqls(&conn)?;
     Ok(())
 }
+
+fn val_append(s: &mut String, val: Value) {
+    match val {
+        Value::Null => s.push_str("NULL"),
+        Value::Integer(v) => s.push_str(&format!("{}", v)),
+        Value::Text(v) => s.push_str(&format!("{}", v)),
+        Value::Blob(v) => s.push_str(&format!("..BLOB..")),
+        Value::Real(v) => s.push_str(&format!("{}", v)),
+    }
+}
+
+fn run_post_sqls(conn: &Connection) -> Result<()> {
+    for sql in CLI.sqls.iter() {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut sb = String::new();
+
+        // todo!("this whole thing is silly and should be redone more elegantly");
+        for i in 0 .. stmt.column_count()-1 {
+            print!("{}{}",stmt.column_names()[i], &CLI.out_delimiter);
+        }
+        println!("{}", stmt.column_names()[stmt.column_count()-1]);
+
+        let mut rows = stmt.query(NO_PARAMS)?;
+        while let Some(row) = rows.next()? {
+            let row: &Row = row;
+            for i in 0 .. row.column_count()-1 {
+                let x: Value = row.get(i)?;
+                val_append(&mut sb, x);
+                sb.push_str(&CLI.out_delimiter);
+            }
+            {
+                let x: Value = row.get(row.column_count()-1)?;
+                val_append(&mut sb, x);
+                println!("{}", &sb);
+                sb.clear();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 
 fn load_file(cfg: &CliCfg, conn: &Connection, pathbuf: &PathBuf) -> Result<()> {
     let tablename = get_table_name(&pathbuf)?;
