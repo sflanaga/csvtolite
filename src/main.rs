@@ -221,7 +221,19 @@ fn schema(cfg: &CliCfg, conn: &Connection, tablename: &str) -> Result<Vec<Field>
     warn!("executing sql: {}", sql);
 
     let mut fields = Vec::new();
-    let mut stmt = conn.prepare(sql.as_str())?;
+    let mut stmt = match conn.prepare(sql.as_str()) {
+        Err(e) => return if cfg.overwrite_tables {
+            // here the drop fails and we think it can be ignored
+            // because it just means it is not there and there
+            // is nothing to drop anyway.
+            warn!("Overwrite set so this error during drop table ignored: \"{}\"", e);
+            Ok(fields)
+        } else {
+            Err(anyhow!(format!("error during schema check: {}" ,e)))
+        },
+        Ok(s) => s,
+    };
+
     let mut rows = stmt.query(NO_PARAMS)?;
     while let Some(row) = rows.next()? {
         let row: &Row = row;
