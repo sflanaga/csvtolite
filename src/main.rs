@@ -11,9 +11,9 @@ use regex::Regex;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
-use csv::{StringRecord};
+use csv::{StringRecord, StringRecordsIntoIter};
 use lazy_static::lazy_static;
-use rusqlite::{Connection, Row, OpenFlags};
+use rusqlite::{Connection, OpenFlags, Params, Row, params};
 use rusqlite::{Statement, NO_PARAMS};
 use rusqlite::types::Value;
 use rusqlite::types::Type::{Null, Integer, Text, Blob};
@@ -458,6 +458,28 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
     Ok(schema)
 }
 
+
+
+struct StringRecordParamed {
+    raw_rec: StringRecord,
+}
+
+impl StringRecordParamed {
+    pub fn new(raw_rec: StringRecord) -> StringRecordParamed {
+        StringRecordParamed {
+            raw_rec,
+        }
+    }
+}
+
+// impl rusqlite::ToSql for StringRecordsIntoIter<&str> {
+//     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+//         todo!()
+//     }
+// }
+
+
+
 fn write_to_db(
     conn: &Connection,
     pathbuf: &PathBuf,
@@ -516,8 +538,10 @@ fn write_to_db(
         }
     }};
 
+
     let (mut row_count, mut field_count) = (0u64, 0u64);
     let mut record = StringRecord::new();
+    let mut param_vec:Vec<String> = Vec::with_capacity(f_sch.len());
     while rec_rdr.read_record(&mut record)? {
         line_count += 1;
         if line_count == 1 && CLI.headeron {
@@ -525,20 +549,22 @@ fn write_to_db(
         } else {
             // we know that stmt must be set by now
             // extend any missing blanks
-            if CLI.ignore_field_count {
-                if f_sch.len() > record.len() {
-                    for _ in record.len()..f_sch.len() {
-                        record.push_field("");
-                    }
-                } else if record.len() > f_sch.len() {
-                    record.truncate(f_sch.len());
-                }
-            } else {
+            if !CLI.ignore_field_count {
                 if record.len() != f_sch.len() {
                     return Err(anyhow!("Error trying batch insert record {}:{} field expected: {}  fields found: {}", pathbuf.display(),line_count, f_sch.len(), record.len()));
                 }
             }
-            stmt.execute(&record)?;
+             
+            param_vec.clear();
+            for (i, s) in param_vec.iter_mut().enumerate() {
+                s.clear();
+                if i < record.len()  {
+                    s.push_str(&record[i]);
+                }
+            }
+            record.iter().for_each(|s| param_vec.push(s.to_string()));
+            stmt.execute(rusqlite::params_from_iter(&param_vec))?;
+            
             row_count += 1;
             field_count += f_sch.len() as u64;
         }
