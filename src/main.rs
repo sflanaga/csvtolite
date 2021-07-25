@@ -190,7 +190,7 @@ fn _does_table_exist(conn: &Connection, tablename: &str) -> Result<Vec<Vec<Strin
     debug!("running sql: {}", &sql);
     let mut fields: Vec<Vec<String>> = Vec::new();
     let mut stmt = conn.prepare(sql.as_str())?;
-    let rows = stmt.query_map(NO_PARAMS, |row| {
+    let rows = stmt.query_map([], |row| {
         let mut v = Vec::new();
         for i in 0..row.column_count() {
             let f = row.get(i)?;
@@ -212,6 +212,10 @@ struct Field {
 }
 
 fn schema(cfg: &CliCfg, conn: &Connection, tablename: &str) -> Result<Vec<Field>> {
+    if tablename.contains(".") {
+        return Err(anyhow!("You cannot have periods in a table name, you have: \"{}\"", tablename));
+    }
+
     let sql = if cfg.overwrite_tables {
         format!("drop table {};", &tablename)
     } else {
@@ -457,27 +461,6 @@ fn detect_file_schema(pathbuf: &PathBuf) -> Result<Vec<Field>> {
 
     Ok(schema)
 }
-
-
-
-struct StringRecordParamed {
-    raw_rec: StringRecord,
-}
-
-impl StringRecordParamed {
-    pub fn new(raw_rec: StringRecord) -> StringRecordParamed {
-        StringRecordParamed {
-            raw_rec,
-        }
-    }
-}
-
-// impl rusqlite::ToSql for StringRecordsIntoIter<&str> {
-//     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-//         todo!()
-//     }
-// }
-
 
 
 fn write_to_db(
