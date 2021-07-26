@@ -6,6 +6,13 @@ edition = "2018"
 description="Import/load csv data into a sqlite3 database"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release]                        
+debug = false                            
+lto = true                               
+codegen-units=1                          
+opt-level = 3                            
+trustflags = ["-C", "target-cpu=native"] 
+
 
 [dependencies]
 anyhow = "1.0.18"

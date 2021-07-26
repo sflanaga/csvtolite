@@ -5,11 +5,15 @@ Created as I use requirements for many different fields (in the thousands) and w
 to automate things not so easy to do in Excel, etc.
 
 ```
-csvtolite -d test.db -r '(....).*csv' -v -f wide_sm.csv
+# using bash for filename expansion
+
+csvtolite --headeron -d test.db -r '(.+)_20210725_.*\..*csv' -v -f wide_20210725_*.csv chisel_20210725_*.csv
 ```
 
-Imports csv files wide_sm.csv into existing sqlite3 database file test.db, 
-creates a table "wide" taken from the -r option's first sub group.
+Imports csv files into existing sqlite3 database file test.db, 
+creates a tables "wide" and "chisel" taken from the -r option's first sub group,
+and loads those 2 types of data into 2 tables with different schemas.  
+The field names are used from the head of those files.
 
 If the table already exists it will cross check the number of fields in the csv file
 with the that table and reuse it.
